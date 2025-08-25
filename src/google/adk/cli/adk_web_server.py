@@ -343,6 +343,56 @@ class AdkWebServer:
     # Run the FastAPI server.
     app = FastAPI(lifespan=internal_lifespan)
 
+    # Helper: Prefetch http(s) file_data into inline_data so the model can consume bytes directly
+    async def _prefetch_file_data_in_content(content: types.Content) -> types.Content:
+      import asyncio
+      from urllib.request import Request as _UrlRequest, urlopen as _urlopen
+      from urllib.error import URLError as _URLError, HTTPError as _HTTPError
+
+      if not content or not content.parts:
+        return content
+
+      MAX_PREFETCH_BYTES = int(os.environ.get("ADK_PREFETCH_MAX_BYTES", "10485760"))  # 10MB default
+      PREFETCH_TIMEOUT = int(os.environ.get("ADK_PREFETCH_TIMEOUT_SECS", "15"))
+
+      async def _download(uri: str, mime_hint: str | None) -> tuple[bytes | None, str | None]:
+        def _blocking_fetch():
+          try:
+            req = _UrlRequest(uri, headers={"User-Agent": "ADK-Prefetch/1.0"})
+            with _urlopen(req, timeout=PREFETCH_TIMEOUT) as resp:
+              clen = resp.headers.get("Content-Length")
+              if clen is not None:
+                try:
+                  if int(clen) > MAX_PREFETCH_BYTES:
+                    raise ValueError("file too large")
+                except Exception:
+                  pass
+              data = resp.read(MAX_PREFETCH_BYTES + 1)
+              if len(data) > MAX_PREFETCH_BYTES:
+                raise ValueError("file too large")
+              mime = mime_hint or resp.headers.get("Content-Type") or "application/octet-stream"
+              mime = mime.split(";")[0].strip()
+              return data, mime
+          except (_URLError, _HTTPError, ValueError) as e:
+            logger.warning("Prefetch failed for %s: %s", uri, e)
+            return None, None
+
+        return await asyncio.to_thread(_blocking_fetch)
+
+      new_parts: list[types.Part] = []
+      for p in content.parts:
+        fd = p.file_data
+        if fd and getattr(fd, "file_uri", None) and str(fd.file_uri).startswith(("http://", "https://")):
+          data, mime = await _download(str(fd.file_uri), getattr(fd, "mime_type", None))
+          if data and mime:
+            try:
+              new_parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+              continue
+            except Exception as e:
+              logger.warning("Converting file_uri to inline_data failed: %s", e)
+        new_parts.append(p)
+      return types.Content(role=content.role, parts=new_parts)
+
     if allow_origins:
       app.add_middleware(
           CORSMiddleware,
@@ -833,6 +883,11 @@ class AdkWebServer:
       if not session:
         raise HTTPException(status_code=404, detail="Session not found")
       runner = await self.get_runner_async(req.app_name)
+      # Convert any http(s) file_data to inline_data before invoking the model.
+      try:
+        req.new_message = await _prefetch_file_data_in_content(req.new_message)
+      except Exception as e:
+        logger.warning("Prefetch middleware error (non-fatal): %s", e)
       async with Aclosing(
           runner.run_async(
               user_id=req.user_id,
@@ -861,6 +916,11 @@ class AdkWebServer:
               StreamingMode.SSE if req.streaming else StreamingMode.NONE
           )
           runner = await self.get_runner_async(req.app_name)
+          # Convert any http(s) file_data to inline_data before invoking the model.
+          try:
+            req.new_message = await _prefetch_file_data_in_content(req.new_message)
+          except Exception as e:
+            logger.warning("Prefetch middleware error (non-fatal): %s", e)
           async with Aclosing(
               runner.run_async(
                   user_id=req.user_id,
